@@ -46,3 +46,22 @@ HF_API_BASE = "https://api-inference.huggingface.co/models"
 
 EXCEL_COLUMNS = ["Title", "Authors", "Abstract", "DOI", "Link", "Source(s)"]
 EXCEL_SENTIMENT_COLUMNS = EXCEL_COLUMNS + ["Sentiment", "Confidence"]
+
+# Default search queries for the query list (PhD project defaults)
+DEFAULT_QUERIES = [
+    '"effervescent atomisation" AND "spray"',
+    '"effervescent atomizer" AND "droplet"',
+    '"twin-fluid atomisation"',
+    '"internal mixing atomizer"',
+    '"effervescent" AND "nozzle" AND "orifice"',
+    '"viscous liquid" AND "atomisation" AND "spray"',
+    '"high viscosity" AND "spray" AND "breakup"',
+    '"shadowgraphy" AND "droplet"',
+    '"Sauter mean diameter" AND "spray"',
+    '"ligament formation" AND "atomisation"',
+    '"gas-to-liquid ratio" AND "spray"',
+    '"synthetic training data" AND "segmentation"',
+    '"domain adaptation" AND "particle detection"',
+    '"silicone" AND "prosthetic" AND "additive manufacturing"',
+    '"aerosol jet printing" AND "coating"',
+]

@@ -2,12 +2,15 @@
 Search tab — main scraping UI.
 
 Layout:
-  ┌─ Left sidebar (280px) ──┬─ Right main area ─────────────────────────┐
-  │  Search input           │  Source progress bars                      │
-  │  Active term chips      │  Results table (scrollable)                │
-  │  Past searches list     │  Bottom bar: stats + export button         │
-  │  Settings section       │                                            │
+  ┌─ Left sidebar (290px) ──┬─ Right main area ─────────────────────────┐
+  │  Query list (editable)  │  Source progress bars                      │
+  │  Add / Load Defaults    │  Results table (scrollable, deduplicated)  │
+  │  Settings section       │  Bottom bar: stats + export button         │
   └─────────────────────────┴────────────────────────────────────────────┘
+
+Search queries are saved in SQLite and pre-populated with DEFAULT_QUERIES
+on first launch.  Results are deduplicated globally across all queries;
+each paper records which queries matched it in a 'matched_queries' field.
 """
 
 from __future__ import annotations
@@ -19,39 +22,16 @@ from typing import Optional
 
 import customtkinter as ctk
 
-from app.config import COLORS, FONT_FAMILY, SOURCES, DEFAULT_MAX_RESULTS, DEFAULT_THREAD_WORKERS
+from app.config import (
+    COLORS, FONT_FAMILY, SOURCES,
+    DEFAULT_MAX_RESULTS, DEFAULT_THREAD_WORKERS, DEFAULT_QUERIES,
+)
 from app.scraper.search_manager import run_search
-from app.export.excel_exporter import export
+from app.export.excel_exporter import export_all
 from app.storage import history as db
 
 
 # ── Small reusable widgets ────────────────────────────────────────────────────
-
-class _Chip(ctk.CTkFrame):
-    """A removable tag chip for a search term."""
-
-    def __init__(self, parent, text: str, on_remove):
-        super().__init__(
-            parent,
-            fg_color=COLORS["tag_bg"],
-            corner_radius=14,
-            border_width=1,
-            border_color=COLORS["tag_border"],
-        )
-        ctk.CTkLabel(
-            self, text=text,
-            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
-            text_color=COLORS["accent"],
-        ).pack(side="left", padx=(10, 2), pady=4)
-        ctk.CTkButton(
-            self, text="×", width=20, height=20,
-            font=ctk.CTkFont(size=14),
-            fg_color="transparent",
-            text_color=COLORS["text_muted"],
-            hover_color=COLORS["bg_tertiary"],
-            command=on_remove,
-        ).pack(side="left", padx=(0, 6), pady=4)
-
 
 class _SourceRow(ctk.CTkFrame):
     """One progress row for a single database source."""
@@ -115,11 +95,11 @@ class SearchTab(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent, fg_color=COLORS["bg_primary"], corner_radius=0)
 
-        self._terms: list[str] = []
-        self._results: dict[str, list[dict]] = {}  # term → papers
-        self._chips: dict[str, _Chip] = {}
+        self._queries: list[str] = []
+        self._all_papers: list[dict] = []   # global deduped results
+        self._query_row_widgets: list = []  # tracked CTkFrame rows in query list
         self._source_rows: dict[str, _SourceRow] = {}
-        self._result_rows: list = []  # tracked result row widgets (safe clear)
+        self._result_rows: list = []
         self._search_running = False
         self._output_dir: str = str(Path.home() / "Desktop")
 
@@ -128,12 +108,19 @@ class SearchTab(ctk.CTkFrame):
         if saved_dir and Path(saved_dir).exists():
             self._output_dir = saved_dir
 
+        # Load saved query list, or use defaults on first launch
+        saved_queries = db.load_setting("query_list")
+        if saved_queries and isinstance(saved_queries, list):
+            self._queries = saved_queries
+        else:
+            self._queries = list(DEFAULT_QUERIES)
+            db.save_setting("query_list", self._queries)
+
         self._build_layout()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _build_layout(self):
-        # Outer two-column grid
         self.columnconfigure(0, weight=0, minsize=290)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -153,10 +140,8 @@ class SearchTab(ctk.CTkFrame):
 
     def _build_sidebar(self):
         sb = self._sidebar
-        pad = {"padx": 16, "pady": (10, 4)}
 
-        # ── Action buttons — packed FIRST with side="bottom" so they are
-        #    always visible regardless of the expanding history frame above.
+        # ── Action buttons — bottom-anchored first so they're always visible ──
         btn_frame = ctk.CTkFrame(sb, fg_color="transparent")
         btn_frame.pack(side="bottom", fill="x", padx=16, pady=12)
         btn_frame.columnconfigure((0, 1), weight=1)
@@ -182,73 +167,24 @@ class SearchTab(ctk.CTkFrame):
         )
         self._clear_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
-        # Separator above buttons (also bottom-anchored)
+        # Separator above buttons
         ctk.CTkFrame(sb, fg_color=COLORS["separator"], height=1, corner_radius=0).pack(
             side="bottom", fill="x", padx=12, pady=(0, 4)
         )
 
-        # ── Everything below packs top-down ───────────────────────────────────
+        # ── Settings section — also bottom-anchored ───────────────────────────
+        settings_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        settings_frame.pack(side="bottom", fill="x")
 
-        # ── Search input ──────────────────────────────────────────────────────
         ctk.CTkLabel(
-            sb, text="Search Terms",
+            settings_frame, text="Settings",
             font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
             text_color=COLORS["text_primary"], anchor="w",
-        ).pack(fill="x", **pad)
+        ).pack(fill="x", padx=16, pady=(10, 4))
 
-        input_row = ctk.CTkFrame(sb, fg_color="transparent")
-        input_row.pack(fill="x", padx=16, pady=(0, 8))
-        input_row.columnconfigure(0, weight=1)
-
-        self._term_entry = ctk.CTkEntry(
-            input_row,
-            placeholder_text="e.g. effervescent AND atomisation",
-            fg_color=COLORS["bg_input"],
-            border_color=COLORS["separator"],
-            text_color=COLORS["text_primary"],
-            placeholder_text_color=COLORS["text_muted"],
-            corner_radius=8,
-            height=36,
-        )
-        self._term_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self._term_entry.bind("<Return>", lambda _: self._add_term())
-
-        ctk.CTkButton(
-            input_row, text="+", width=36, height=36,
-            font=ctk.CTkFont(size=18),
-            fg_color=COLORS["accent"],
-            hover_color=COLORS["accent_hover"],
-            corner_radius=8,
-            command=self._add_term,
-        ).grid(row=0, column=1)
-
-        ctk.CTkLabel(
-            sb,
-            text="Use AND to require both terms  ·  use OR for alternatives\n"
-                 "e.g. effervescent AND atomisation OR effervescent AND atomization",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=10),
-            text_color=COLORS["text_muted"],
-            anchor="w", justify="left",
-        ).pack(fill="x", padx=16, pady=(0, 6))
-
-        # ── Active chips area (plain frame — CTkScrollableFrame corrupts on
-        #    winfo_children() clear, so we use a regular CTkFrame and track
-        #    chips explicitly in self._chips) ──────────────────────────────────
-        self._chips_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        self._chips_frame.pack(fill="x", padx=16, pady=(0, 6))
-
-        _sep(sb)
-
-        # ── Search settings ───────────────────────────────────────────────────
-        ctk.CTkLabel(
-            sb, text="Settings",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
-            text_color=COLORS["text_primary"], anchor="w",
-        ).pack(fill="x", **pad)
-
-        _lbl(sb, "Max results per source")
+        _lbl(settings_frame, "Max results per source")
         self._max_results_var = ctk.IntVar(value=db.load_setting("max_results", DEFAULT_MAX_RESULTS))
-        slider_row = ctk.CTkFrame(sb, fg_color="transparent")
+        slider_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
         slider_row.pack(fill="x", padx=16, pady=(0, 6))
         slider_row.columnconfigure(0, weight=1)
         self._results_slider = ctk.CTkSlider(
@@ -267,9 +203,9 @@ class SearchTab(ctk.CTkFrame):
         ).grid(row=0, column=1, padx=(8, 0))
         self._max_results_var.trace_add("write", lambda *_: db.save_setting("max_results", self._max_results_var.get()))
 
-        _lbl(sb, "Concurrent sources")
+        _lbl(settings_frame, "Concurrent sources")
         self._workers_var = ctk.IntVar(value=db.load_setting("workers", DEFAULT_THREAD_WORKERS))
-        workers_row = ctk.CTkFrame(sb, fg_color="transparent")
+        workers_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
         workers_row.pack(fill="x", padx=16, pady=(0, 6))
         workers_row.columnconfigure(0, weight=1)
         ctk.CTkSlider(
@@ -287,9 +223,9 @@ class SearchTab(ctk.CTkFrame):
         ).grid(row=0, column=1, padx=(8, 0))
         self._workers_var.trace_add("write", lambda *_: db.save_setting("workers", self._workers_var.get()))
 
-        _lbl(sb, "Export folder")
-        dir_row = ctk.CTkFrame(sb, fg_color="transparent")
-        dir_row.pack(fill="x", padx=16, pady=(0, 6))
+        _lbl(settings_frame, "Export folder")
+        dir_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        dir_row.pack(fill="x", padx=16, pady=(0, 10))
         dir_row.columnconfigure(0, weight=1)
         self._dir_label = ctk.CTkLabel(
             dir_row,
@@ -309,24 +245,62 @@ class SearchTab(ctk.CTkFrame):
             command=self._choose_dir,
         ).grid(row=0, column=1, padx=(8, 0))
 
-        _sep(sb)
+        ctk.CTkFrame(sb, fg_color=COLORS["separator"], height=1, corner_radius=0).pack(
+            side="bottom", fill="x", padx=12, pady=(4, 0)
+        )
 
-        # ── Past searches ─────────────────────────────────────────────────────
+        # ── Add query controls — also bottom-anchored (above settings) ────────
+        add_frame = ctk.CTkFrame(sb, fg_color="transparent")
+        add_frame.pack(side="bottom", fill="x", padx=16, pady=(4, 6))
+        add_frame.columnconfigure(0, weight=1)
+
+        self._query_entry = ctk.CTkEntry(
+            add_frame,
+            placeholder_text="\"phrase\" AND \"phrase\"",
+            fg_color=COLORS["bg_input"],
+            border_color=COLORS["separator"],
+            text_color=COLORS["text_primary"],
+            placeholder_text_color=COLORS["text_muted"],
+            corner_radius=8,
+            height=34,
+        )
+        self._query_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._query_entry.bind("<Return>", lambda _: self._add_query())
+
+        ctk.CTkButton(
+            add_frame, text="+", width=34, height=34,
+            font=ctk.CTkFont(size=18),
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            corner_radius=8,
+            command=self._add_query,
+        ).grid(row=0, column=1)
+
+        ctk.CTkButton(
+            add_frame, text="Load Defaults", height=28,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            fg_color=COLORS["bg_tertiary"],
+            hover_color=COLORS["bg_input"],
+            text_color=COLORS["text_secondary"],
+            corner_radius=6,
+            command=self._load_default_queries,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        # ── Query list — top section, expands to fill remaining space ─────────
         ctk.CTkLabel(
-            sb, text="Recent Searches",
+            sb, text="Search Queries",
             font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
             text_color=COLORS["text_primary"], anchor="w",
-        ).pack(fill="x", **pad)
+        ).pack(side="top", fill="x", padx=16, pady=(10, 4))
 
-        # expand=True is safe here because buttons are already anchored to bottom
-        self._history_frame = ctk.CTkScrollableFrame(
+        self._query_list_scroll = ctk.CTkScrollableFrame(
             sb, fg_color="transparent",
             scrollbar_button_color=COLORS["bg_tertiary"],
             scrollbar_button_hover_color=COLORS["accent"],
         )
-        self._history_frame.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+        self._query_list_scroll.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 4))
 
-        self._refresh_history()
+        self._render_query_list()
 
     def _build_main(self):
         m = self._main
@@ -354,7 +328,6 @@ class SearchTab(ctk.CTkFrame):
             row_widget.grid(row=i // 2, column=i % 2, sticky="ew", padx=6, pady=3)
             self._source_rows[key] = row_widget
 
-        # Overall progress
         self._overall_progress = ctk.CTkProgressBar(
             progress_panel, height=4,
             fg_color=COLORS["bg_tertiary"],
@@ -370,13 +343,11 @@ class SearchTab(ctk.CTkFrame):
         table_frame.rowconfigure(1, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        # Column headers
         self._header_row = ctk.CTkFrame(table_frame, fg_color=COLORS["bg_tertiary"], height=36, corner_radius=0)
         self._header_row.grid(row=0, column=0, sticky="ew")
         self._header_row.grid_propagate(False)
         self._build_table_headers()
 
-        # Scrollable rows
         self._table_scroll = ctk.CTkScrollableFrame(
             table_frame, fg_color="transparent",
             scrollbar_button_color=COLORS["bg_tertiary"],
@@ -387,7 +358,7 @@ class SearchTab(ctk.CTkFrame):
 
         self._empty_label = ctk.CTkLabel(
             self._table_scroll,
-            text="Enter search terms and click Search to begin.",
+            text="Select queries and click Search to begin.",
             font=ctk.CTkFont(family=FONT_FAMILY, size=14),
             text_color=COLORS["text_muted"],
         )
@@ -421,7 +392,7 @@ class SearchTab(ctk.CTkFrame):
 
     def _build_table_headers(self):
         cols = [
-            ("Term", 110), ("Title", 260), ("Authors", 160),
+            ("Query", 110), ("Title", 260), ("Authors", 160),
             ("Abstract", 340), ("Source(s)", 100),
         ]
         for col_idx, (name, width) in enumerate(cols):
@@ -432,74 +403,77 @@ class SearchTab(ctk.CTkFrame):
                 anchor="w",
             ).pack(side="left", padx=(12 if col_idx == 0 else 4, 0))
 
-    # ── Term management ────────────────────────────────────────────────────────
+    # ── Query list management ──────────────────────────────────────────────────
 
-    def _add_term(self):
-        term = self._term_entry.get().strip()
-        if not term or term in self._terms:
-            self._term_entry.delete(0, "end")
-            return
-        self._terms.append(term)
-        self._term_entry.delete(0, "end")
-        self._render_chips()
-
-    def _remove_term(self, term: str):
-        if term in self._terms:
-            self._terms.remove(term)
-        self._render_chips()
-
-    def _render_chips(self):
-        # Destroy only our tracked chip widgets — never use winfo_children() on
-        # a CTkScrollableFrame as it returns internal canvas/scrollbar widgets.
-        for chip in list(self._chips.values()):
-            chip.destroy()
-        self._chips.clear()
-        for term in self._terms:
-            chip = _Chip(self._chips_frame, term, lambda t=term: self._remove_term(t))
-            chip.pack(anchor="w", pady=2, fill="x")
-            self._chips[term] = chip
-
-    # ── History ────────────────────────────────────────────────────────────────
-
-    def _refresh_history(self):
-        # Destroy tracked history row widgets explicitly — safe for CTkScrollableFrame
-        for w in getattr(self, "_history_rows", []):
+    def _render_query_list(self):
+        for w in list(self._query_row_widgets):
             try:
                 w.destroy()
             except Exception:
                 pass
-        self._history_rows = []
-        for term in db.get_search_history(25):
-            row = ctk.CTkFrame(self._history_frame, fg_color="transparent")
-            row.pack(fill="x", pady=1)
-            row.columnconfigure(0, weight=1)
-            self._history_rows.append(row)
-            ctk.CTkButton(
-                row, text=term, anchor="w", height=28,
-                font=ctk.CTkFont(family=FONT_FAMILY, size=12),
-                fg_color="transparent",
-                hover_color=COLORS["bg_tertiary"],
-                text_color=COLORS["text_secondary"],
+        self._query_row_widgets.clear()
+
+        for query in self._queries:
+            row = ctk.CTkFrame(
+                self._query_list_scroll,
+                fg_color=COLORS["bg_tertiary"],
                 corner_radius=6,
-                command=lambda t=term: self._load_from_history(t),
-            ).grid(row=0, column=0, sticky="ew")
+            )
+            row.pack(fill="x", pady=2)
+            row.columnconfigure(0, weight=1)
+            self._query_row_widgets.append(row)
+
+            lbl = ctk.CTkLabel(
+                row, text=query,
+                font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+                text_color=COLORS["text_primary"],
+                anchor="w", justify="left", wraplength=210,
+                cursor="hand2",
+            )
+            lbl.grid(row=0, column=0, padx=(8, 2), pady=4, sticky="w")
+            # Click label → load into entry for editing (removes from list)
+            lbl.bind("<Button-1>", lambda e, q=query: self._edit_query(q))
+
             ctk.CTkButton(
                 row, text="×", width=24, height=24,
-                font=ctk.CTkFont(size=12),
+                font=ctk.CTkFont(size=13),
                 fg_color="transparent",
-                hover_color=COLORS["bg_tertiary"],
                 text_color=COLORS["text_muted"],
-                command=lambda t=term: self._delete_history(t),
-            ).grid(row=0, column=1)
+                hover_color=COLORS["bg_input"],
+                corner_radius=4,
+                command=lambda q=query: self._remove_query(q),
+            ).grid(row=0, column=1, padx=(2, 4), pady=4)
 
-    def _load_from_history(self, term: str):
-        if term not in self._terms:
-            self._terms.append(term)
-            self._render_chips()
+    def _add_query(self):
+        text = self._query_entry.get().strip()
+        if not text or text in self._queries:
+            self._query_entry.configure(border_color=COLORS["error"])
+            self.after(800, lambda: self._query_entry.configure(border_color=COLORS["separator"]))
+            return
+        self._queries.append(text)
+        self._query_entry.delete(0, "end")
+        db.save_setting("query_list", self._queries)
+        self._render_query_list()
 
-    def _delete_history(self, term: str):
-        db.delete_search_term(term)
-        self._refresh_history()
+    def _remove_query(self, query: str):
+        if query in self._queries:
+            self._queries.remove(query)
+        db.save_setting("query_list", self._queries)
+        self._render_query_list()
+
+    def _edit_query(self, query: str):
+        """Load query into entry field and remove from list (for editing)."""
+        self._queries.remove(query)
+        db.save_setting("query_list", self._queries)
+        self._query_entry.delete(0, "end")
+        self._query_entry.insert(0, query)
+        self._query_entry.focus()
+        self._render_query_list()
+
+    def _load_default_queries(self):
+        self._queries = list(DEFAULT_QUERIES)
+        db.save_setting("query_list", self._queries)
+        self._render_query_list()
 
     # ── Settings ───────────────────────────────────────────────────────────────
 
@@ -525,28 +499,27 @@ class SearchTab(ctk.CTkFrame):
     def _start_search(self):
         if self._search_running:
             return
-        if not self._terms:
-            self._flash_entry()
+        if not self._queries:
+            self._query_entry.configure(border_color=COLORS["error"])
+            self.after(800, lambda: self._query_entry.configure(border_color=COLORS["separator"]))
             return
 
         self._search_running = True
         self._search_btn.configure(text="Searching…", state="disabled")
         self._export_btn.configure(state="disabled")
-        self._results.clear()
+        self._all_papers = []
         self._clear_table()
 
-        # Reset progress bars
         for row in self._source_rows.values():
             row.reset()
         self._overall_progress.set(0)
 
-        terms = list(self._terms)  # snapshot at click time — thread-safe, bug-safe
-        total_ops = len(terms) * len(SOURCES)
+        queries = list(self._queries)
+        total_ops = len(queries) * len(SOURCES)
         self._completed_ops = 0
         self._source_counts: dict[str, int] = {k: 0 for k in SOURCES}
 
         def progress_cb(source_key: str, status: str):
-            """Called from worker threads — must schedule GUI updates on main thread."""
             def _update():
                 row = self._source_rows.get(source_key)
                 if row is None:
@@ -554,7 +527,6 @@ class SearchTab(ctk.CTkFrame):
                 if status == "searching":
                     row.set_searching()
                 elif status == "done":
-                    # Count will be updated after search completes; just mark done
                     row.set_done(self._source_counts.get(source_key, 0))
                     self._completed_ops += 1
                     self._overall_progress.set(self._completed_ops / total_ops)
@@ -567,50 +539,45 @@ class SearchTab(ctk.CTkFrame):
         def _worker():
             max_r = self._max_results_var.get()
             workers = self._workers_var.get()
+            results_by_query: dict[str, list[dict]] = {}
 
-            for term in terms:
+            for query in queries:
                 papers = run_search(
-                    term,
+                    query,
                     max_results=max_r,
                     max_workers=workers,
                     progress_callback=progress_cb,
                 )
-                self._results[term] = papers
+                results_by_query[query] = papers
 
-                def _add_rows(t=term, ps=papers):
-                    # Count only here (on main thread) to avoid double-counting
+                def _update_source_counts(ps=papers):
                     for key in SOURCES:
                         cnt = sum(1 for p in ps if SOURCES[key] in p.get("source", ""))
                         self._source_counts[key] = self._source_counts.get(key, 0) + cnt
                         src_row = self._source_rows.get(key)
                         if src_row:
                             src_row.set_done(self._source_counts[key])
-                    self._add_results_to_table(t, ps)
+                self.after(0, _update_source_counts)
 
-                self.after(0, _add_rows)
-
-                db.add_search_term(term)
-                self.after(0, self._refresh_history)
+            # Global deduplication across all queries
+            all_papers = _global_dedup(results_by_query)
+            self._all_papers = all_papers
 
             def _finish():
                 self._search_running = False
                 self._search_btn.configure(text="Search", state="normal")
-                total = sum(len(v) for v in self._results.values())
                 self._stats_label.configure(
-                    text=f"{total} papers found across {len(terms)} search term(s).",
+                    text=f"{len(all_papers)} unique papers found across {len(queries)} queries.",
                     text_color=COLORS["text_secondary"],
                 )
-                if total > 0:
+                if all_papers:
                     self._export_btn.configure(state="normal")
                 self._overall_progress.set(1)
+                self._render_results(all_papers)
 
             self.after(0, _finish)
 
         threading.Thread(target=_worker, daemon=True).start()
-
-    def _flash_entry(self):
-        self._term_entry.configure(border_color=COLORS["error"])
-        self.after(800, lambda: self._term_entry.configure(border_color=COLORS["separator"]))
 
     # ── Table rendering ────────────────────────────────────────────────────────
 
@@ -631,25 +598,42 @@ class SearchTab(ctk.CTkFrame):
         )
         self._empty_label.pack(pady=60)
 
-    def _add_results_to_table(self, term: str, papers: list[dict]):
-        # Remove placeholder label once we have real results
+    def _render_results(self, papers: list[dict]):
+        for w in list(self._result_rows):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._result_rows.clear()
         if hasattr(self, "_empty_label") and self._empty_label.winfo_exists():
             self._empty_label.destroy()
 
         if not papers:
             lbl = ctk.CTkLabel(
                 self._table_scroll,
-                text=f'No results found for "{term}".',
-                font=ctk.CTkFont(family=FONT_FAMILY, size=13),
+                text="No results found.",
+                font=ctk.CTkFont(family=FONT_FAMILY, size=14),
                 text_color=COLORS["text_muted"],
             )
-            lbl.pack(anchor="w", padx=16, pady=6)
+            lbl.pack(pady=60)
             self._result_rows.append(lbl)
             return
+
+        queries_list = list(self._queries)
 
         for idx, paper in enumerate(papers):
             alt = idx % 2 == 0
             bg = COLORS["bg_tertiary"] if alt else COLORS["bg_secondary"]
+
+            matched = paper.get("matched_queries", [])
+            # Build compact query label: "Q1", "Q1,Q3", etc. (1-indexed)
+            q_indices = []
+            for q in matched:
+                try:
+                    q_indices.append(f"Q{queries_list.index(q) + 1}")
+                except ValueError:
+                    q_indices.append("Q?")
+            q_label = ", ".join(q_indices) if q_indices else "—"
 
             row = ctk.CTkFrame(
                 self._table_scroll,
@@ -661,15 +645,13 @@ class SearchTab(ctk.CTkFrame):
             row.columnconfigure(2, weight=1)
             self._result_rows.append(row)
 
-            # Term chip (small)
             ctk.CTkLabel(
-                row, text=term[:14] + ("…" if len(term) > 14 else ""),
+                row, text=q_label,
                 width=106, anchor="w",
                 font=ctk.CTkFont(family=FONT_FAMILY, size=11),
                 text_color=COLORS["accent"],
             ).grid(row=0, column=0, padx=(10, 4), pady=8, sticky="nw")
 
-            # Title
             ctk.CTkLabel(
                 row, text=_trunc(paper.get("title", ""), 60),
                 width=256, anchor="w", justify="left", wraplength=250,
@@ -677,7 +659,6 @@ class SearchTab(ctk.CTkFrame):
                 text_color=COLORS["text_primary"],
             ).grid(row=0, column=1, padx=4, pady=8, sticky="nw")
 
-            # Authors
             ctk.CTkLabel(
                 row, text=_trunc(paper.get("authors", ""), 40),
                 width=156, anchor="w",
@@ -685,7 +666,6 @@ class SearchTab(ctk.CTkFrame):
                 text_color=COLORS["text_muted"],
             ).grid(row=0, column=2, padx=4, pady=8, sticky="nw")
 
-            # Abstract (truncated)
             ctk.CTkLabel(
                 row, text=_trunc(paper.get("abstract", ""), 140),
                 anchor="w", justify="left", wraplength=330,
@@ -693,7 +673,6 @@ class SearchTab(ctk.CTkFrame):
                 text_color=COLORS["text_secondary"],
             ).grid(row=0, column=3, padx=4, pady=8, sticky="nw")
 
-            # Source badge
             ctk.CTkLabel(
                 row, text=paper.get("source", ""),
                 width=96, anchor="center",
@@ -701,16 +680,14 @@ class SearchTab(ctk.CTkFrame):
                 text_color=COLORS["text_muted"],
             ).grid(row=0, column=4, padx=(4, 10), pady=8, sticky="n")
 
-            # Click → detail popup
             for widget in row.winfo_children():
                 widget.bind("<Button-1>", lambda e, p=paper: self._show_detail(p))
             row.bind("<Button-1>", lambda e, p=paper: self._show_detail(p))
 
     def _show_detail(self, paper: dict):
-        """Open a modal popup with the full paper details."""
         win = ctk.CTkToplevel(self)
         win.title(paper.get("title", "Paper Details")[:60])
-        win.geometry("700x540")
+        win.geometry("700x560")
         win.configure(fg_color=COLORS["bg_primary"])
         win.grab_set()
 
@@ -736,6 +713,8 @@ class SearchTab(ctk.CTkFrame):
         _field("DOI", paper.get("doi"))
         _field("Link", paper.get("url"))
         _field("Source(s)", paper.get("source"))
+        matched = paper.get("matched_queries", [])
+        _field("Matched Queries", "\n".join(matched) if matched else "—")
 
         ctk.CTkButton(
             win, text="Close", width=100,
@@ -748,10 +727,10 @@ class SearchTab(ctk.CTkFrame):
     # ── Export ─────────────────────────────────────────────────────────────────
 
     def _export(self):
-        if not self._results:
+        if not self._all_papers:
             return
         try:
-            path = export(self._results, self._output_dir, include_sentiment=False)
+            path = export_all(self._all_papers, self._output_dir)
             self._stats_label.configure(
                 text=f"Exported to: {path}",
                 text_color=COLORS["success"],
@@ -763,9 +742,7 @@ class SearchTab(ctk.CTkFrame):
             )
 
     def _clear_results(self):
-        self._results.clear()
-        self._terms.clear()
-        self._render_chips()
+        self._all_papers = []
         for row in self._source_rows.values():
             row.reset()
         self._overall_progress.set(0)
@@ -779,7 +756,7 @@ class SearchTab(ctk.CTkFrame):
             self._empty_label.destroy()
         self._empty_label = ctk.CTkLabel(
             self._table_scroll,
-            text="Enter search terms and click Search to begin.",
+            text="Select queries and click Search to begin.",
             font=ctk.CTkFont(family=FONT_FAMILY, size=14),
             text_color=COLORS["text_muted"],
         )
@@ -790,11 +767,48 @@ class SearchTab(ctk.CTkFrame):
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def get_current_papers(self) -> list[dict]:
-        """Return flat list of all current search results (for sentiment tab)."""
-        all_papers = []
-        for papers in self._results.values():
-            all_papers.extend(papers)
-        return all_papers
+        """Return flat deduplicated list of all current search results."""
+        return list(self._all_papers)
+
+
+# ── Global deduplication ──────────────────────────────────────────────────────
+
+def _global_dedup(results_by_query: dict[str, list[dict]]) -> list[dict]:
+    """
+    Deduplicate papers across all queries.
+    Merges 'source' and builds 'matched_queries: list[str]' on each paper.
+    """
+    doi_index: dict[str, dict] = {}
+    title_index: dict[str, dict] = {}
+    result: list[dict] = []
+
+    for query, papers in results_by_query.items():
+        for p in papers:
+            doi = (p.get("doi") or "").lower().strip()
+            title_key = (p.get("title") or "").lower().strip()[:80]
+
+            existing = None
+            if doi and doi in doi_index:
+                existing = doi_index[doi]
+            elif not doi and title_key and title_key in title_index:
+                existing = title_index[title_key]
+
+            if existing is not None:
+                src = p.get("source", "")
+                if src and src not in existing["source"]:
+                    existing["source"] += f", {src}"
+                if query not in existing["matched_queries"]:
+                    existing["matched_queries"].append(query)
+            else:
+                new_p = dict(p)
+                new_p["matched_queries"] = [query]
+                result.append(new_p)
+                if doi:
+                    doi_index[doi] = new_p
+                if title_key:
+                    title_index[title_key] = new_p
+
+    return result
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

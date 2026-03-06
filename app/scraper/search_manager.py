@@ -3,15 +3,20 @@ Parallel search orchestrator across all configured academic sources.
 
 Each source runs in its own thread (max `max_workers` concurrently).
 Results are standardised to a common dict schema and deduplicated by DOI.
+
+Phrase search is supported:
+  - arXiv: uses all:"phrase" field syntax via the Atom API
+  - PubMed: uses "phrase"[tiab] field tag via NCBI E-utilities
+  - bioRxiv/medRxiv: Europe PMC API passes queries through (Lucene syntax, quotes work)
+  - ChemRxiv: Figshare API simple text search (phrases stripped of quotes)
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-import tempfile
+import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
@@ -21,92 +26,176 @@ from app.config import SOURCES, DEFAULT_MAX_RESULTS, DEFAULT_THREAD_WORKERS
 
 logger = logging.getLogger(__name__)
 
-# ── Standardised paper schema keys ─────────────────────────────────────────
-# title, authors (str), abstract, doi, url, source (str)
-
-def _normalise(raw: dict, source_key: str) -> dict:
-    """Convert a raw paperscraper dict into our standard schema."""
-    authors = raw.get("authors", [])
-    if isinstance(authors, list):
-        authors = ", ".join(str(a) for a in authors)
-
-    return {
-        "title": str(raw.get("title", "") or "").strip(),
-        "authors": str(authors).strip(),
-        "abstract": str(raw.get("abstract", "") or "").strip(),
-        "doi": str(raw.get("doi", "") or "").strip(),
-        "url": str(raw.get("url", "") or raw.get("link", "") or "").strip(),
-        "source": SOURCES.get(source_key, source_key),
-    }
+NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
 
-def _read_jsonl(path: str) -> list[dict]:
-    papers = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        papers.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as exc:
-        logger.warning("Could not read temp file %s: %s", path, exc)
-    return papers
+# ── Query helpers ─────────────────────────────────────────────────────────────
 
+def _to_arxiv_query(query: str) -> str:
+    """Convert our query string to arXiv all: field prefix format.
 
-# ── Query parsing ────────────────────────────────────────────────────────────
-
-def _parse_query(query: str) -> list[list[str]]:
+    "effervescent atomisation" AND "spray"
+        → all:"effervescent atomisation" AND all:"spray"
     """
-    Convert a query string into paperscraper keyword format (list of AND-groups).
+    def _prefix(m):
+        term = m.group(0)
+        if term.upper() in ("AND", "OR", "ANDNOT"):
+            return term
+        return f"all:{term}"
+    return re.sub(r'"[^"]*"|\b\w+\b', _prefix, query)
 
-    "effervescent AND atomisation"
-        → [["effervescent", "atomisation"]]
 
-    "effervescent AND atomisation OR effervescent AND atomization"
-        → [["effervescent", "atomisation"], ["effervescent", "atomization"]]
+def _to_pubmed_query(query: str) -> str:
+    """Add [tiab] field tag to quoted phrases for PubMed title/abstract search."""
+    return re.sub(r'"([^"]+)"', r'"\1"[tiab]', query)
 
-    Plain strings with no operators pass through unchanged:
-    "machine learning"  → [["machine learning"]]
-    """
-    or_groups = re.split(r'\s+OR\s+', query.strip(), flags=re.IGNORECASE)
-    return [
-        [t.strip() for t in re.split(r'\s+AND\s+', group.strip(), flags=re.IGNORECASE)]
-        for group in or_groups
-        if group.strip()
-    ]
+
+def _to_chemrxiv_term(query: str) -> str:
+    """Strip quotes and boolean operators for ChemRxiv simple text search."""
+    result = re.sub(r'"([^"]+)"', r'\1', query)
+    result = re.sub(r'\bAND\b|\bOR\b|\bANDNOT\b', ' ', result, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', result).strip()
 
 
 # ── Per-source search functions ──────────────────────────────────────────────
 
 def _search_arxiv(query: str, max_results: int) -> list[dict]:
-    from paperscraper.arxiv import get_and_dump_arxiv_papers
-    tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-    tmp.close()
-    try:
-        get_and_dump_arxiv_papers(_parse_query(query), tmp.name, max_results=max_results)
-        return [_normalise(p, "arxiv") for p in _read_jsonl(tmp.name)]
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+    """Search arXiv using the Atom API with proper phrase search support."""
+    arxiv_query = _to_arxiv_query(query)
+    url = "https://export.arxiv.org/api/query"
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+
+    all_papers: list[dict] = []
+    start = 0
+    batch = 100
+
+    while len(all_papers) < max_results:
+        fetch = min(batch, max_results - len(all_papers))
+        params = {"search_query": arxiv_query, "start": start, "max_results": fetch}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+
+        root = ET.fromstring(resp.content)
+        entries = root.findall("atom:entry", ns)
+        if not entries:
+            break
+
+        for entry in entries:
+            arxiv_id = entry.findtext("atom:id", "", ns) or ""
+            doi = (entry.findtext("arxiv:doi", "", ns) or "").strip()
+            title = (entry.findtext("atom:title", "", ns) or "").strip().replace("\n ", " ")
+            abstract = (entry.findtext("atom:summary", "", ns) or "").strip().replace("\n", " ")
+            authors = ", ".join(
+                (a.findtext("atom:name", "", ns) or "")
+                for a in entry.findall("atom:author", ns)
+            )
+            all_papers.append({
+                "title": title,
+                "authors": authors,
+                "abstract": abstract,
+                "doi": doi,
+                "url": arxiv_id,
+                "source": SOURCES["arxiv"],
+            })
+
+        if len(entries) < fetch:
+            break
+        start += len(entries)
+        time.sleep(3)  # arXiv rate limit
+
+    return all_papers[:max_results]
 
 
 def _search_pubmed(query: str, max_results: int) -> list[dict]:
-    from paperscraper.pubmed import get_and_dump_pubmed_papers
-    tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-    tmp.close()
-    try:
-        get_and_dump_pubmed_papers(_parse_query(query), tmp.name, max_results=max_results)
-        return [_normalise(p, "pubmed") for p in _read_jsonl(tmp.name)]
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+    """Search PubMed via NCBI E-utilities with phrase search support."""
+    pm_query = _to_pubmed_query(query)
+
+    # Step 1: esearch to get count and use history server
+    search_params = {
+        "db": "pubmed",
+        "term": pm_query,
+        "retmax": min(max_results, 10000),
+        "usehistory": "y",
+        "retmode": "json",
+    }
+    resp = requests.get(NCBI_BASE + "esearch.fcgi", params=search_params, timeout=30)
+    resp.raise_for_status()
+    esearch = resp.json().get("esearchresult", {})
+    total = int(esearch.get("count", 0))
+    webenv = esearch.get("webenv", "")
+    query_key = esearch.get("querykey", "")
+
+    if not total or not webenv:
+        return []
+
+    # Step 2: efetch in batches
+    papers: list[dict] = []
+    retstart = 0
+    batch = 100
+
+    while len(papers) < min(total, max_results):
+        fetch_params = {
+            "db": "pubmed",
+            "query_key": query_key,
+            "WebEnv": webenv,
+            "retstart": retstart,
+            "retmax": min(batch, max_results - len(papers)),
+            "rettype": "xml",
+            "retmode": "xml",
+        }
+        resp = requests.get(NCBI_BASE + "efetch.fcgi", params=fetch_params, timeout=60)
+        resp.raise_for_status()
+
+        root = ET.fromstring(resp.content)
+        articles = root.findall(".//PubmedArticle")
+        if not articles:
+            break
+
+        for article in articles:
+            mc = article.find("MedlineCitation")
+            if mc is None:
+                continue
+            art = mc.find("Article")
+            if art is None:
+                continue
+
+            title = (art.findtext("ArticleTitle", "") or "").strip()
+            abstract_parts = art.findall(".//AbstractText")
+            abstract = " ".join((t.text or "") for t in abstract_parts).strip()
+
+            authors = []
+            for a in art.findall(".//Author"):
+                ln = a.findtext("LastName", "")
+                fn = a.findtext("ForeName", "")
+                name = f"{fn} {ln}".strip() if fn else ln
+                if name:
+                    authors.append(name)
+
+            pmid = (mc.findtext("PMID", "") or "").strip()
+            doi = ""
+            for id_el in article.findall(".//ArticleId"):
+                if id_el.get("IdType") == "doi":
+                    doi = (id_el.text or "").strip()
+                    break
+
+            papers.append({
+                "title": title,
+                "authors": ", ".join(authors),
+                "abstract": abstract,
+                "doi": doi,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+                "source": SOURCES["pubmed"],
+            })
+
+        if len(articles) < batch:
+            break
+        retstart += len(articles)
+        time.sleep(0.34)  # NCBI rate limit ~3 req/sec
+
+    return papers[:max_results]
 
 
 def _search_biorxiv(query: str, max_results: int) -> list[dict]:
@@ -123,6 +212,7 @@ def _search_via_europepmc(query: str, server: str, max_results: int) -> list[dic
     """
     Search bioRxiv or medRxiv preprints via Europe PMC REST API.
     Paginates via cursorMark to support up to max_results > 100.
+    Quoted phrases in the query are passed through (Lucene syntax supported).
     """
     publisher = {"biorxiv": "bioRxiv", "medrxiv": "medRxiv"}[server]
     url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -172,11 +262,12 @@ def _search_via_europepmc(query: str, server: str, max_results: int) -> list[dic
 def _search_chemrxiv(query: str, max_results: int) -> list[dict]:
     """Search ChemRxiv via their public Figshare-based API. Paginates in batches of 50."""
     url = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
+    term = _to_chemrxiv_term(query)
     raw_hits: list[dict] = []
     skip = 0
     while len(raw_hits) < max_results:
         batch = min(50, max_results - len(raw_hits))
-        params = {"term": query, "limit": batch, "skip": skip}
+        params = {"term": term, "limit": batch, "skip": skip}
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -190,7 +281,7 @@ def _search_chemrxiv(query: str, max_results: int) -> list[dict]:
 
     papers = []
     for hit in raw_hits[:max_results]:
-        item = hit.get("item", hit)  # handle both nested {"item": {...}} and flat
+        item = hit.get("item", hit)
         doi = item.get("doi", "") or ""
         authors = ", ".join(
             f"{a.get('firstName', '')} {a.get('lastName', '')}".strip()

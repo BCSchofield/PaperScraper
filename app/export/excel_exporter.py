@@ -78,6 +78,71 @@ def _safe_str(value) -> str:
     return s[:_EXCEL_MAX_CHARS]
 
 
+def export_all(papers: list[dict], output_dir: str) -> str:
+    """
+    Write all papers to a single 'All Results' sheet.
+    Papers must have 'matched_queries': list[str] from the global dedup step.
+    Returns the full path of the saved file.
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    if not os.access(str(out_path), os.W_OK):
+        raise PermissionError(
+            f"Export folder is not writable: {output_dir}\n"
+            "Please choose a different folder."
+        )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"PaperScraper_{timestamp}.xlsx"
+    filepath = os.path.join(output_dir, filename)
+
+    columns = ["Title", "Authors", "Abstract", "DOI", "Link", "Source(s)", "Matched Queries"]
+    widths = [40, 30, 70, 25, 35, 20, 50]
+
+    wb = openpyxl.Workbook()
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
+
+    ws = wb.create_sheet(title="All Results")
+    ws.row_dimensions[1].height = 28
+    ws.freeze_panes = "A2"
+    ws.sheet_properties.tabColor = _ACCENT
+
+    for col_idx, col_name in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        _header_style(cell)
+
+    for row_idx, paper in enumerate(papers, start=2):
+        alt = row_idx % 2 == 0
+        matched = paper.get("matched_queries", [])
+        row_data = [
+            _safe_str(paper.get("title", "")),
+            _safe_str(paper.get("authors", "")),
+            _safe_str(paper.get("abstract", "")),
+            _safe_str(paper.get("doi", "")),
+            _safe_str(paper.get("url", "")),
+            _safe_str(paper.get("source", "")),
+            _safe_str("; ".join(matched)),
+        ]
+        for col_idx, value in enumerate(row_data, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            _data_style(cell, alt)
+            col_name = columns[col_idx - 1]
+            if col_name == "DOI" and value:
+                doi_url = value if value.startswith("http") else f"https://doi.org/{value}"
+                cell.hyperlink = doi_url
+                cell.font = Font(color=_ACCENT, underline="single", name="Calibri", size=10)
+            if col_name == "Link" and value:
+                cell.hyperlink = value
+                cell.font = Font(color=_ACCENT, underline="single", name="Calibri", size=10)
+
+    for col_idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    wb.save(filepath)
+    return filepath
+
+
 def export(
     results_by_term: dict[str, list[dict]],
     output_dir: str,
