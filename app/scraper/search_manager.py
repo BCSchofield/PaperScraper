@@ -10,9 +10,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
+
+import requests
 
 from app.config import SOURCES, DEFAULT_MAX_RESULTS, DEFAULT_THREAD_WORKERS
 
@@ -53,6 +56,29 @@ def _read_jsonl(path: str) -> list[dict]:
     return papers
 
 
+# ── Query parsing ────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> list[list[str]]:
+    """
+    Convert a query string into paperscraper keyword format (list of AND-groups).
+
+    "effervescent AND atomisation"
+        → [["effervescent", "atomisation"]]
+
+    "effervescent AND atomisation OR effervescent AND atomization"
+        → [["effervescent", "atomisation"], ["effervescent", "atomization"]]
+
+    Plain strings with no operators pass through unchanged:
+    "machine learning"  → [["machine learning"]]
+    """
+    or_groups = re.split(r'\s+OR\s+', query.strip(), flags=re.IGNORECASE)
+    return [
+        [t.strip() for t in re.split(r'\s+AND\s+', group.strip(), flags=re.IGNORECASE)]
+        for group in or_groups
+        if group.strip()
+    ]
+
+
 # ── Per-source search functions ──────────────────────────────────────────────
 
 def _search_arxiv(query: str, max_results: int) -> list[dict]:
@@ -60,7 +86,7 @@ def _search_arxiv(query: str, max_results: int) -> list[dict]:
     tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     tmp.close()
     try:
-        get_and_dump_arxiv_papers([[query]], tmp.name, max_results=max_results)
+        get_and_dump_arxiv_papers(_parse_query(query), tmp.name, max_results=max_results)
         return [_normalise(p, "arxiv") for p in _read_jsonl(tmp.name)]
     finally:
         try:
@@ -74,7 +100,7 @@ def _search_pubmed(query: str, max_results: int) -> list[dict]:
     tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     tmp.close()
     try:
-        get_and_dump_pubmed_papers([[query]], tmp.name, max_results=max_results)
+        get_and_dump_pubmed_papers(_parse_query(query), tmp.name, max_results=max_results)
         return [_normalise(p, "pubmed") for p in _read_jsonl(tmp.name)]
     finally:
         try:
@@ -83,32 +109,110 @@ def _search_pubmed(query: str, max_results: int) -> list[dict]:
             pass
 
 
-def _search_xrxiv(server: str, query: str, max_results: int) -> list[dict]:
-    """bioRxiv / medRxiv / ChemRxiv via paperscraper's XRXivQuery."""
-    from paperscraper.xrxiv.xrxiv_query import XRXivQuery
-    scraper = XRXivQuery(server)
-    tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-    tmp.close()
-    try:
-        scraper.search_keywords(
-            keywords=[query],
-            output_filepath=tmp.name,
-            max_results=max_results,
+def _search_biorxiv(query: str, max_results: int) -> list[dict]:
+    """Search bioRxiv via Europe PMC API (no local files required)."""
+    return _search_via_europepmc(query, "biorxiv", max_results)
+
+
+def _search_medrxiv(query: str, max_results: int) -> list[dict]:
+    """Search medRxiv via Europe PMC API (no local files required)."""
+    return _search_via_europepmc(query, "medrxiv", max_results)
+
+
+def _search_via_europepmc(query: str, server: str, max_results: int) -> list[dict]:
+    """
+    Search bioRxiv or medRxiv preprints via Europe PMC REST API.
+    Paginates via cursorMark to support up to max_results > 100.
+    """
+    publisher = {"biorxiv": "bioRxiv", "medrxiv": "medRxiv"}[server]
+    url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+    base_q = f'({query}) AND SRC:PPR AND PUBLISHER:"{publisher}"'
+
+    raw_items: list[dict] = []
+    cursor = "*"
+    while len(raw_items) < max_results:
+        batch = min(100, max_results - len(raw_items))
+        params = {
+            "query": base_q,
+            "format": "json",
+            "pageSize": batch,
+            "resultType": "core",
+            "cursorMark": cursor,
+        }
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        page = (data.get("resultList") or {}).get("result", [])
+        if not page:
+            break
+        raw_items.extend(page)
+        next_cursor = data.get("nextCursorMark")
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    papers = []
+    for r in raw_items[:max_results]:
+        doi = r.get("doi", "") or ""
+        authors = ", ".join(
+            a.get("fullName", "")
+            for a in (r.get("authorList") or {}).get("author", [])
         )
-        return [_normalise(p, server) for p in _read_jsonl(tmp.name)]
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        papers.append({
+            "title": (r.get("title") or "").rstrip("."),
+            "authors": authors,
+            "abstract": r.get("abstractText", "") or "",
+            "doi": doi,
+            "url": f"https://doi.org/{doi}" if doi else "",
+            "source": SOURCES.get(server, server),
+        })
+    return papers
+
+
+def _search_chemrxiv(query: str, max_results: int) -> list[dict]:
+    """Search ChemRxiv via their public Figshare-based API. Paginates in batches of 50."""
+    url = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
+    raw_hits: list[dict] = []
+    skip = 0
+    while len(raw_hits) < max_results:
+        batch = min(50, max_results - len(raw_hits))
+        params = {"term": query, "limit": batch, "skip": skip}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        page = data.get("itemHits", [])
+        if not page:
+            break
+        raw_hits.extend(page)
+        skip += len(page)
+        if len(page) < batch:
+            break
+
+    papers = []
+    for hit in raw_hits[:max_results]:
+        item = hit.get("item", hit)  # handle both nested {"item": {...}} and flat
+        doi = item.get("doi", "") or ""
+        authors = ", ".join(
+            f"{a.get('firstName', '')} {a.get('lastName', '')}".strip()
+            for a in (item.get("authors") or [])
+        )
+        papers.append({
+            "title": str(item.get("title", "") or "").strip(),
+            "authors": authors,
+            "abstract": str(item.get("abstract", "") or item.get("description", "") or "").strip(),
+            "doi": doi,
+            "url": f"https://doi.org/{doi}" if doi else item.get("htmlUrl", ""),
+            "source": SOURCES.get("chemrxiv", "ChemRxiv"),
+        })
+    return papers
 
 
 _SOURCE_FN = {
     "arxiv": _search_arxiv,
     "pubmed": _search_pubmed,
-    "biorxiv": lambda q, n: _search_xrxiv("biorxiv", q, n),
-    "medrxiv": lambda q, n: _search_xrxiv("medrxiv", q, n),
-    "chemrxiv": lambda q, n: _search_xrxiv("chemrxiv", q, n),
+    "biorxiv": _search_biorxiv,
+    "medrxiv": _search_medrxiv,
+    "chemrxiv": _search_chemrxiv,
 }
 
 

@@ -58,10 +58,12 @@ class MainWindow(ctk.CTk):
 
         self.tabs.add("Search")
         self.tabs.add("Sentiment Analysis")
+        self.tabs.add("Framing Analysis")
 
         # Lazy import to avoid circular deps at module level
         from app.gui.search_tab import SearchTab
         from app.gui.sentiment_tab import SentimentTab
+        from app.gui.framing_tab import FramingTab
 
         self._search_tab = SearchTab(self.tabs.tab("Search"))
         self._search_tab.pack(fill="both", expand=True)
@@ -71,3 +73,9 @@ class MainWindow(ctk.CTk):
             get_papers_fn=self._search_tab.get_current_papers,
         )
         self._sentiment_tab.pack(fill="both", expand=True)
+
+        self._framing_tab = FramingTab(
+            self.tabs.tab("Framing Analysis"),
+            get_papers_fn=self._search_tab.get_current_papers,
+        )
+        self._framing_tab.pack(fill="both", expand=True)

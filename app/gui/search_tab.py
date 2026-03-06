@@ -119,6 +119,7 @@ class SearchTab(ctk.CTkFrame):
         self._results: dict[str, list[dict]] = {}  # term → papers
         self._chips: dict[str, _Chip] = {}
         self._source_rows: dict[str, _SourceRow] = {}
+        self._result_rows: list = []  # tracked result row widgets (safe clear)
         self._search_running = False
         self._output_dir: str = str(Path.home() / "Desktop")
 
@@ -201,7 +202,7 @@ class SearchTab(ctk.CTkFrame):
 
         self._term_entry = ctk.CTkEntry(
             input_row,
-            placeholder_text="e.g. machine learning cancer",
+            placeholder_text="e.g. effervescent AND atomisation",
             fg_color=COLORS["bg_input"],
             border_color=COLORS["separator"],
             text_color=COLORS["text_primary"],
@@ -220,6 +221,15 @@ class SearchTab(ctk.CTkFrame):
             corner_radius=8,
             command=self._add_term,
         ).grid(row=0, column=1)
+
+        ctk.CTkLabel(
+            sb,
+            text="Use AND to require both terms  ·  use OR for alternatives\n"
+                 "e.g. effervescent AND atomisation OR effervescent AND atomization",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=10),
+            text_color=COLORS["text_muted"],
+            anchor="w", justify="left",
+        ).pack(fill="x", padx=16, pady=(0, 6))
 
         # ── Active chips area (plain frame — CTkScrollableFrame corrupts on
         #    winfo_children() clear, so we use a regular CTkFrame and track
@@ -242,7 +252,7 @@ class SearchTab(ctk.CTkFrame):
         slider_row.pack(fill="x", padx=16, pady=(0, 6))
         slider_row.columnconfigure(0, weight=1)
         self._results_slider = ctk.CTkSlider(
-            slider_row, from_=10, to=200, number_of_steps=19,
+            slider_row, from_=10, to=500, number_of_steps=49,
             variable=self._max_results_var,
             fg_color=COLORS["bg_tertiary"],
             button_color=COLORS["accent"],
@@ -530,7 +540,8 @@ class SearchTab(ctk.CTkFrame):
             row.reset()
         self._overall_progress.set(0)
 
-        total_ops = len(self._terms) * len(SOURCES)
+        terms = list(self._terms)  # snapshot at click time — thread-safe, bug-safe
+        total_ops = len(terms) * len(SOURCES)
         self._completed_ops = 0
         self._source_counts: dict[str, int] = {k: 0 for k in SOURCES}
 
@@ -557,7 +568,7 @@ class SearchTab(ctk.CTkFrame):
             max_r = self._max_results_var.get()
             workers = self._workers_var.get()
 
-            for term in self._terms:
+            for term in terms:
                 papers = run_search(
                     term,
                     max_results=max_r,
@@ -586,7 +597,7 @@ class SearchTab(ctk.CTkFrame):
                 self._search_btn.configure(text="Search", state="normal")
                 total = sum(len(v) for v in self._results.values())
                 self._stats_label.configure(
-                    text=f"{total} papers found across {len(self._terms)} search term(s).",
+                    text=f"{total} papers found across {len(terms)} search term(s).",
                     text_color=COLORS["text_secondary"],
                 )
                 if total > 0:
@@ -604,8 +615,14 @@ class SearchTab(ctk.CTkFrame):
     # ── Table rendering ────────────────────────────────────────────────────────
 
     def _clear_table(self):
-        for w in self._table_scroll.winfo_children():
-            w.destroy()
+        for w in list(self._result_rows):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._result_rows.clear()
+        if hasattr(self, "_empty_label") and self._empty_label.winfo_exists():
+            self._empty_label.destroy()
         self._empty_label = ctk.CTkLabel(
             self._table_scroll,
             text="Searching…",
@@ -620,12 +637,14 @@ class SearchTab(ctk.CTkFrame):
             self._empty_label.destroy()
 
         if not papers:
-            ctk.CTkLabel(
+            lbl = ctk.CTkLabel(
                 self._table_scroll,
                 text=f'No results found for "{term}".',
                 font=ctk.CTkFont(family=FONT_FAMILY, size=13),
                 text_color=COLORS["text_muted"],
-            ).pack(anchor="w", padx=16, pady=6)
+            )
+            lbl.pack(anchor="w", padx=16, pady=6)
+            self._result_rows.append(lbl)
             return
 
         for idx, paper in enumerate(papers):
@@ -640,6 +659,7 @@ class SearchTab(ctk.CTkFrame):
             )
             row.pack(fill="x", padx=4, pady=2)
             row.columnconfigure(2, weight=1)
+            self._result_rows.append(row)
 
             # Term chip (small)
             ctk.CTkLabel(
@@ -749,8 +769,14 @@ class SearchTab(ctk.CTkFrame):
         for row in self._source_rows.values():
             row.reset()
         self._overall_progress.set(0)
-        for w in self._table_scroll.winfo_children():
-            w.destroy()
+        for w in list(self._result_rows):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._result_rows.clear()
+        if hasattr(self, "_empty_label") and self._empty_label.winfo_exists():
+            self._empty_label.destroy()
         self._empty_label = ctk.CTkLabel(
             self._table_scroll,
             text="Enter search terms and click Search to begin.",

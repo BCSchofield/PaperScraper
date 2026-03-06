@@ -1,13 +1,12 @@
 """
-Sentiment Analysis tab.
+Framing Analysis tab.
 
-Allows the user to:
-  1. Load papers from the current Search session OR import an Excel file.
-  2. Enter a topic to score sentiment against.
-  3. Optionally supply a HuggingFace API token.
-  4. Run analysis (with per-paper progress bar).
-  5. Browse results with Sentiment + Confidence columns.
-  6. Export the enriched results to Excel.
+Classifies each paper as positive / negative / neutral through a specific
+domain lens, e.g. "economic", "political", "environmental".
+
+The HuggingFace zero-shot model scores each abstract against:
+  "This paper has a {} <frame> view on <topic>."
+→ e.g. "This paper has a positive economic view on climate change."
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from app.export.excel_exporter import export
 from app.storage import history as db
 
 
-class SentimentTab(ctk.CTkFrame):
+class FramingTab(ctk.CTkFrame):
 
     def __init__(self, parent, get_papers_fn: Callable[[], list[dict]]):
         super().__init__(parent, fg_color=COLORS["bg_primary"], corner_radius=0)
@@ -99,24 +98,70 @@ class SentimentTab(ctk.CTkFrame):
 
         _sep(sb)
 
-        # ── Topic input ───────────────────────────────────────────────────────
+        # ── Frame / context input ─────────────────────────────────────────────
         ctk.CTkLabel(
-            sb, text="Analysis Topic",
+            sb, text="Context / Frame",
             font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
             text_color=COLORS["text_primary"], anchor="w",
         ).pack(fill="x", **pad)
 
         ctk.CTkLabel(
             sb,
-            text="What topic should the sentiment be scored against?",
+            text="What lens should the paper be read through?",
             font=ctk.CTkFont(family=FONT_FAMILY, size=11),
             text_color=COLORS["text_muted"],
             anchor="w", justify="left", wraplength=258,
+        ).pack(fill="x", padx=16, pady=(0, 4))
+
+        self._frame_entry = ctk.CTkEntry(
+            sb,
+            placeholder_text="e.g. economic",
+            fg_color=COLORS["bg_input"],
+            border_color=COLORS["separator"],
+            text_color=COLORS["text_primary"],
+            placeholder_text_color=COLORS["text_muted"],
+            corner_radius=8,
+            height=36,
+        )
+        self._frame_entry.pack(fill="x", padx=16, pady=(0, 4))
+
+        ctk.CTkLabel(
+            sb,
+            text="Examples:\neconomic  ·  political  ·  environmental\npublic health  ·  cultural  ·  ethical",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=10),
+            text_color=COLORS["text_muted"],
+            anchor="w", justify="left",
         ).pack(fill="x", padx=16, pady=(0, 6))
+
+        # Restore saved frame
+        saved_frame = db.load_setting("framing_frame", "")
+        if saved_frame:
+            self._frame_entry.insert(0, saved_frame)
+        self._frame_entry.bind(
+            "<FocusOut>",
+            lambda _: db.save_setting("framing_frame", self._frame_entry.get().strip()),
+        )
+
+        _sep(sb)
+
+        # ── Topic input ───────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            sb, text="Paper Topic",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            text_color=COLORS["text_primary"], anchor="w",
+        ).pack(fill="x", **pad)
+
+        ctk.CTkLabel(
+            sb,
+            text="What subject are the papers about?",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            text_color=COLORS["text_muted"],
+            anchor="w", justify="left", wraplength=258,
+        ).pack(fill="x", padx=16, pady=(0, 4))
 
         self._topic_entry = ctk.CTkEntry(
             sb,
-            placeholder_text="e.g. CRISPR gene editing safety",
+            placeholder_text="e.g. climate change",
             fg_color=COLORS["bg_input"],
             border_color=COLORS["separator"],
             text_color=COLORS["text_primary"],
@@ -128,20 +173,19 @@ class SentimentTab(ctk.CTkFrame):
 
         ctk.CTkLabel(
             sb,
-            text="Examples:\nvaccine safety  ·  AI ethics\nantibiotic resistance  ·  gene therapy",
+            text="Examples:\nclimate change  ·  gene therapy\nCOVID-19  ·  mental health  ·  AI",
             font=ctk.CTkFont(family=FONT_FAMILY, size=10),
             text_color=COLORS["text_muted"],
             anchor="w", justify="left",
-        ).pack(fill="x", padx=16, pady=(0, 4))
+        ).pack(fill="x", padx=16, pady=(0, 6))
 
         # Restore saved topic
-        saved_topic = db.load_setting("sentiment_topic", "")
+        saved_topic = db.load_setting("framing_topic", "")
         if saved_topic:
             self._topic_entry.insert(0, saved_topic)
-
         self._topic_entry.bind(
             "<FocusOut>",
-            lambda _: db.save_setting("sentiment_topic", self._topic_entry.get().strip()),
+            lambda _: db.save_setting("framing_topic", self._topic_entry.get().strip()),
         )
 
         _sep(sb)
@@ -173,7 +217,6 @@ class SentimentTab(ctk.CTkFrame):
             height=36,
         )
         self._token_entry.pack(fill="x", padx=16, pady=(0, 4))
-        # Token is intentionally NOT persisted to disk — enter each session
 
         _sep(sb)
 
@@ -202,9 +245,9 @@ class SentimentTab(ctk.CTkFrame):
 
         _sep(sb)
 
-        # ── Analyse button ────────────────────────────────────────────────────
+        # ── Run button ────────────────────────────────────────────────────────
         self._analyse_btn = ctk.CTkButton(
-            sb, text="Run Sentiment Analysis", height=44,
+            sb, text="Run Framing Analysis", height=44,
             font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold"),
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
@@ -213,7 +256,6 @@ class SentimentTab(ctk.CTkFrame):
         )
         self._analyse_btn.pack(fill="x", padx=16, pady=(8, 4))
 
-        # Progress
         self._progress_bar = ctk.CTkProgressBar(
             sb, height=6,
             fg_color=COLORS["bg_tertiary"],
@@ -240,7 +282,7 @@ class SentimentTab(ctk.CTkFrame):
         header.grid_propagate(False)
 
         cols = [
-            ("Title", 260), ("Authors", 150), ("Abstract", 310),
+            ("Title", 260), ("Authors", 150), ("Abstract", 300),
             ("Sentiment", 100), ("Confidence", 100),
         ]
         for i, (name, width) in enumerate(cols):
@@ -262,7 +304,7 @@ class SentimentTab(ctk.CTkFrame):
 
         self._placeholder = ctk.CTkLabel(
             self._table_scroll,
-            text="Load papers and run analysis to see results here.",
+            text="Load papers, enter a context and topic, then run analysis.",
             font=ctk.CTkFont(family=FONT_FAMILY, size=14),
             text_color=COLORS["text_muted"],
         )
@@ -356,11 +398,21 @@ class SentimentTab(ctk.CTkFrame):
                 text="Load papers first.", text_color=COLORS["warning"]
             )
             return
+
+        frame = self._frame_entry.get().strip()
         topic = self._topic_entry.get().strip()
+
+        if not frame:
+            self._frame_entry.configure(border_color=COLORS["error"])
+            self.after(800, lambda: self._frame_entry.configure(border_color=COLORS["separator"]))
+            return
         if not topic:
             self._topic_entry.configure(border_color=COLORS["error"])
             self.after(800, lambda: self._topic_entry.configure(border_color=COLORS["separator"]))
             return
+
+        # Build hypothesis: "This paper has a {} economic view on climate change."
+        hypothesis = f"This paper has a {{}} {frame} view on {topic}."
 
         self._running = True
         self._results.clear()
@@ -370,7 +422,6 @@ class SentimentTab(ctk.CTkFrame):
         self._clear_table()
 
         token = self._token_entry.get().strip() or None
-        total = len(self._papers)
 
         def _cb(done: int, tot: int):
             def _update():
@@ -379,15 +430,20 @@ class SentimentTab(ctk.CTkFrame):
             self.after(0, _update)
 
         def _worker():
-            results = analyse_papers(self._papers, topic, api_token=token, progress_callback=_cb)
+            results = analyse_papers(
+                self._papers, topic,
+                api_token=token,
+                hypothesis_template=hypothesis,
+                progress_callback=_cb,
+            )
             self._results = results
 
             def _finish():
                 self._running = False
-                self._analyse_btn.configure(text="Run Sentiment Analysis", state="normal")
-                self._render_results(results)
+                self._analyse_btn.configure(text="Run Framing Analysis", state="normal")
+                self._render_results(results, frame)
                 self._stats_label.configure(
-                    text=f'{len(results)} papers analysed for topic: "{topic}"',
+                    text=f'{len(results)} papers — {frame} view on "{topic}"',
                     text_color=COLORS["text_secondary"],
                 )
                 self._export_btn.configure(state="normal")
@@ -408,7 +464,7 @@ class SentimentTab(ctk.CTkFrame):
         if hasattr(self, "_placeholder") and self._placeholder.winfo_exists():
             self._placeholder.destroy()
 
-    def _render_results(self, results: list[dict]):
+    def _render_results(self, results: list[dict], frame: str):
         self._clear_table()
         if not results:
             lbl = ctk.CTkLabel(
@@ -455,7 +511,7 @@ class SentimentTab(ctk.CTkFrame):
 
             ctk.CTkLabel(
                 row, text=_trunc(paper.get("abstract", ""), 120),
-                anchor="w", justify="left", wraplength=310,
+                anchor="w", justify="left", wraplength=300,
                 font=ctk.CTkFont(family=FONT_FAMILY, size=11),
                 text_color=COLORS["text_secondary"],
             ).pack(side="left", padx=4, pady=8, expand=True, fill="x")
@@ -466,21 +522,20 @@ class SentimentTab(ctk.CTkFrame):
                 text_color=sentiment_color, anchor="center",
             ).pack(side="left", padx=4, pady=8)
 
-            conf_pct = f"{confidence * 100:.1f}%"
             ctk.CTkLabel(
-                row, text=conf_pct, width=96,
+                row, text=f"{confidence * 100:.1f}%", width=96,
                 font=ctk.CTkFont(family=FONT_FAMILY, size=12),
                 text_color=COLORS["text_muted"], anchor="center",
             ).pack(side="left", padx=(4, 10), pady=8)
 
             for widget in row.winfo_children():
-                widget.bind("<Button-1>", lambda e, p=paper: self._show_detail(p))
-            row.bind("<Button-1>", lambda e, p=paper: self._show_detail(p))
+                widget.bind("<Button-1>", lambda e, p=paper, f=frame: self._show_detail(p, f))
+            row.bind("<Button-1>", lambda e, p=paper, f=frame: self._show_detail(p, f))
 
-    def _show_detail(self, paper: dict):
+    def _show_detail(self, paper: dict, frame: str):
         win = ctk.CTkToplevel(self)
         win.title(paper.get("title", "Paper Details")[:60])
-        win.geometry("700x580")
+        win.geometry("700x600")
         win.configure(fg_color=COLORS["bg_primary"])
         win.grab_set()
 
@@ -505,12 +560,15 @@ class SentimentTab(ctk.CTkFrame):
         _field("Abstract", paper.get("abstract"))
 
         sentiment = paper.get("sentiment", "error")
-        s_color = {"positive": COLORS["success"], "negative": COLORS["error"],
-                   "neutral": COLORS["text_muted"]}.get(sentiment, COLORS["warning"])
-        sentiment_text = f"{sentiment.capitalize()} ({paper.get('confidence', 0)*100:.1f}% confidence)"
+        s_color = {
+            "positive": COLORS["success"],
+            "negative": COLORS["error"],
+            "neutral": COLORS["text_muted"],
+        }.get(sentiment, COLORS["warning"])
+        framing_text = f"{sentiment.capitalize()} ({paper.get('confidence', 0)*100:.1f}% confidence)"
         if sentiment == "error" and paper.get("error_detail"):
-            sentiment_text += f"\n\nAPI error: {paper['error_detail']}"
-        _field("Sentiment", sentiment_text, s_color)
+            framing_text += f"\n\nAPI error: {paper['error_detail']}"
+        _field(f"Framing ({frame})", framing_text, s_color)
         _field("Source(s)", paper.get("source"))
 
         ctk.CTkButton(
@@ -526,8 +584,9 @@ class SentimentTab(ctk.CTkFrame):
     def _export(self):
         if not self._results:
             return
-        topic = self._topic_entry.get().strip() or "sentiment"
-        results_map = {f"Sentiment — {topic}": self._results}
+        frame = self._frame_entry.get().strip() or "framing"
+        topic = self._topic_entry.get().strip() or "topic"
+        results_map = {f"Framing — {frame} — {topic}"[:31]: self._results}
         try:
             path = export(results_map, self._output_dir, include_sentiment=True)
             self._stats_label.configure(

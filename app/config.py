@@ -13,7 +13,7 @@ COLORS = {
     "bg_input": "#3a3a3c",
     "accent": "#0a84ff",
     "accent_hover": "#0071e3",
-    "accent_dim": "#0a84ff33",
+    "accent_dim": "#1a3a5c",
     "text_primary": "#ffffff",
     "text_secondary": "#ebebf5",
     "text_muted": "#8e8e93",
@@ -21,7 +21,7 @@ COLORS = {
     "success": "#30d158",
     "warning": "#ff9f0a",
     "error": "#ff453a",
-    "tag_bg": "#0a84ff22",
+    "tag_bg": "#1a3555",
     "tag_border": "#0a84ff",
     "row_hover": "#323234",
 }
